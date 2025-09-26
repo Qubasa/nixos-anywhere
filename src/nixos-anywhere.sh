@@ -58,9 +58,11 @@ hasWget=
 hasCurl=
 hasSetsid=
 hasNixOSFacter=
+remoteHomeDir=
+remoteLogFile=
 
 tempDir=$(mktemp -d)
-trap 'rm -rf "$tempDir"' EXIT
+trap 'rm -rf "$tempDir" && (runSshNoTty  -o ConnectTimeout=10 rm -f "$remoteLogFile" || true)' EXIT
 mkdir -p "$tempDir"
 
 declare -A diskEncryptionKeys=()
@@ -68,6 +70,7 @@ declare -A extraFilesOwnership=()
 declare -a nixCopyOptions=()
 declare -a sshArgs=("-o" "IdentitiesOnly=yes" "-i" "$tempDir/nixos-anywhere" "-o" "UserKnownHostsFile=/dev/null" "-o" "StrictHostKeyChecking=no")
 
+# Can be called from anywhere in the script to drop into a debug shell
 breakpoint() {
   (
     set +x
@@ -75,11 +78,7 @@ breakpoint() {
 
     # Create a temporary directory for debug files
     debugTmpDir=$(mktemp -d /tmp/nixos-anywhere-debug.XXXXXX)
-    # we need to export this var as the trap will access it outside of function context
-    export debugTmpDir
-
-    # Set up cleanup trap
-    trap 'rm -rf "$debugTmpDir"' RETURN
+    chmod 700 "$debugTmpDir" # Secure the directory
 
     # Save all variables (local and exported) to a file
     (
@@ -100,7 +99,7 @@ exec 0</dev/tty
 
 # Show some helpful info
 echo "Debug shell started. All variables from parent scope are available."
-echo "Example: echo \\$tempDir"
+echo "Example: echo \\\$tempDir"
 echo "Type 'exit' to continue execution."
 
 # Set a nice prompt
@@ -112,6 +111,9 @@ EOF
 
     # Start an interactive shell with explicit terminal redirection
     bash --rcfile "$debugTmpDir/debug_rcfile.sh" </dev/tty >/dev/tty 2>&1
+
+    # Cleanup the temporary directory
+    rm -rf "$debugTmpDir"
   )
 }
 
@@ -571,25 +573,28 @@ importFacts() {
   if ! facts=$(runSsh -o ConnectTimeout=10 enableDebug=$enableDebug sh -- <"$here"/get-facts.sh); then
     exit 1
   fi
-  filteredFacts=$(echo "$facts" | grep -E '^(has|is)[A-Za-z0-9_]+=\S+')
+  filteredFacts=$(echo "$facts" | grep -E '^(has|is|remote)[A-Za-z0-9_]+=\S+')
   if [[ -z $filteredFacts ]]; then
     abort "Retrieving host facts via SSH failed. Check with --debug for the root cause, unless you have done so already"
   fi
 
+  # disable debug output temporarily to prevent log spam
   set +x
+
   # make facts available in script
   # shellcheck disable=SC2046
   export $(echo "$filteredFacts" | xargs)
 
   # Necessary to prevent Bash erroring before printing out which fact had an issue
   set +u
-  for var in isOs isArch isInstaller isContainer isRoot hasIpv6Only hasTar hasCpio hasSudo hasDoas hasWget hasCurl hasSetsid; do
+  for var in isOs isArch isInstaller isContainer isRoot hasIpv6Only hasTar hasCpio hasSudo hasDoas hasWget hasCurl hasSetsid remoteHomeDir remoteLogFile; do
     if [[ -z ${!var} ]]; then
       abort "Failed to retrieve fact $var from host"
     fi
   done
   set -u
 
+  # re-enable debug output if it was enabled
   if [[ -n ${enableDebug} ]]; then
     set -x
   fi
@@ -716,6 +721,15 @@ runKexec() {
     kexecUrl=${kexecUrl/"github.com"/"gh-v6.com"}
   fi
 
+  # Where does $remoteLogFile come from?
+  # It's defined in the get-facts.sh script and imported via importFacts()
+  # and generates a random temporary file path on the remote machine
+  # this makes it possible to fetch the log file in case kexec fails
+  # as normal user without prompting for the sudo password again
+  if [[ -z $remoteLogFile ]]; then
+    abort "Could not create a temporary log file for $sshUser"
+  fi
+
   # Unified kexec error handling function
   handleKexecResult() {
     local exitCode=$1
@@ -728,7 +742,7 @@ runKexec() {
       local logContent=""
       if logContent=$(
         set +x
-        runSsh "cat /tmp/kexec-output.log 2>/dev/null" 2>/dev/null
+        runSsh "cat \"$remoteLogFile\" 2>/dev/null" 2>/dev/null
       ); then
         echo "Remote output log:" >&2
         echo "$logContent" >&2
@@ -736,13 +750,6 @@ runKexec() {
       echo "$operation failed" >&2
       exit 1
     fi
-
-    # Clean up the log file
-    echo "Cleaning up remote kexec log file" >&2
-    (
-      set +x
-      runSsh "rm -f /tmp/kexec-output.log" 2>/dev/null || true
-    )
   }
 
   # Define common remote commands template
@@ -764,9 +771,9 @@ echo 'Downloading kexec tarball (this may take a moment)...'
 KEXEC_SCRIPT
 
 # Run the script and let output flow naturally  
-${maybeSudo} bash \"\$kexec_script_tmp\" 2>&1 | tee /tmp/kexec-output.log || true
+${maybeSudo} bash \"\$kexec_script_tmp\" 2>&1 | tee \"$remoteLogFile\" || true
 # The script will likely disconnect us, so we consider it successful if we see the kexec message
-if grep -q 'machine will boot into nixos' /tmp/kexec-output.log; then
+if grep -q 'machine will boot into nixos' \"$remoteLogFile\"; then
   echo 'Kexec initiated successfully'
   exit 0
 else
@@ -820,15 +827,17 @@ fi
 
     handleKexecResult $sshExitCode "Kexec"
   else
-    # Query remote home directory for the user
-    remoteHomeDir=$(runSshNoTty -o ConnectTimeout=10 "getent passwd \"$sshUser\" | cut -d: -f6")
+    # Why do we need $remoteHomeDir?
+    # In the case where the ssh user is not root, we need to upload the kexec tarball
+    # to a location where the user has write permissions. We then use sudo to run
+    # kexec from that location.
     if [[ -z $remoteHomeDir ]]; then
       abort "Could not determine home directory for user $sshUser"
     fi
 
     (
       set +x
-      "${localUploadCommand[@]}" | runSsh "cat > \"$remoteHomeDir\"/kexec-tarball.tar.gz"
+      "${localUploadCommand[@]}" | runSsh "cat > ~/kexec-tarball.tar.gz"
     )
 
     # Use local command with pipe to remote
@@ -1040,6 +1049,13 @@ main() {
   if [[ ${phases[kexec]} == 1 ]]; then
     runKexec
   fi
+
+  # overwrite trap to not cleanup remoteLogFile anymore
+  # as doing that after the "done" step creates issues in tests
+  trap 'rm -rf "$tempDir"' EXIT
+
+  # clean up temporary log file regardless of kexec phase
+  runSshNoTty -o ConnectTimeout=10 rm -f "$remoteLogFile"
 
   if [[ ${hardwareConfigBackend} != "none" ]]; then
     generateHardwareConfig

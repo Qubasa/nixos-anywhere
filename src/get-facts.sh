@@ -20,4 +20,6 @@ hasWget=$(has wget)
 hasCurl=$(has curl)
 hasSetsid=$(has setsid)
 hasNixOSFacter=$(command -v nixos-facter >/dev/null && echo "y" || echo "n")
+remoteHomeDir=$HOME
+remoteLogFile=$(mktemp /tmp/nixos-anywhere-remote-log.XXXXXX)
 FACTS
